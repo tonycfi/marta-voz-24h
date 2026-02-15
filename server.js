@@ -114,7 +114,8 @@ wss.on("connection", (twilioWs) => {
 
   let callSid = "";
   let fromNumber = "";
-  let transcript = ""; // iremos acumulando texto
+  let transcript = "";// iremos acumulando texto
+  let streamSid = ""; 
 
   // Conexión a OpenAI Realtime
   const openaiWs = new WebSocket(
