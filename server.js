@@ -154,25 +154,24 @@ function safeJsonParse(text) {
 async function extractTicket({ transcript, night }) {
   const model = process.env.EXTRACT_MODEL || "gpt-4o-mini";
 
-  const prompt = `
-Extrae un PARTE de servicio desde esta conversación (en español).
-Devuelve SOLO JSON válido con estas claves EXACTAS:
+  const system = `
+Eres un extractor. Devuelve SOLO JSON válido (sin texto alrededor).
+Claves EXACTAS:
 nombre, telefono, direccion, zona, servicio, averia, urgente, aceptoNocturno, notas.
 
 Reglas:
 - servicio debe ser uno de:
   fontanería, electricidad, cerrajería, persianas, electrodomésticos, pintura, mantenimiento, aire acondicionado, termo
 - urgente: "si" o "no"
-- Si night=${night} entonces aceptoNocturno debe ser "si" o "no" (si no se menciona, "no")
-- Si night=${night} es false, aceptoNocturno debe ser "n-a"
-- Si falta un dato: string vacío "".
-- notas: cualquier detalle útil.
+- Si night=${night} entonces aceptoNocturno: "si" o "no" (si no se menciona, "no")
+- Si night=${night} es false, aceptoNocturno: "n-a"
+- Si falta un dato: "" (string vacío)
+- notas: cualquier detalle útil
+`.trim();
 
-TRANSCRIPCIÓN:
-${transcript || ""}
-`;
+  const user = `TRANSCRIPCIÓN:\n${transcript || ""}`;
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
@@ -180,42 +179,21 @@ ${transcript || ""}
     },
     body: JSON.stringify({
       model,
-      input: prompt
-      // (Sin forzar formato para evitar el error "response_format moved")
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: user }
+      ]
     })
   });
 
   const raw = await resp.text();
   if (!resp.ok) throw new Error(`OpenAI extract failed: ${resp.status} ${raw}`);
 
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    // raro, pero por si acaso
-    return null;
-  }
-  
-  function getResponseText(respJson) {
-    if (!respJson) return "";
-    if (typeof respJson.output_text === "string" && respJson.output_text.trim()) {
-      return respJson.output_text.trim();
-    }
-    const out = respJson.output;
-    if (!Array.isArray(out)) return "";
-    let acc = "";
-    for (const item of out) {
-      const content = item?.content;
-      if (!Array.isArray(content)) continue;
-      for (const c of content) {
-        if (c?.type === "output_text" && typeof c?.text === "string") acc += c.text;
-        if (c?.type === "text" && typeof c?.text === "string") acc += c.text;
-      }
-    }
-    return acc.trim();
-  }
-  const out = getResponseText(json);
-  return safeJsonParse(out);
+  const json = JSON.parse(raw);
+  const content = json?.choices?.[0]?.message?.content || "";
+  return JSON.parse(content);
 }
 
 function formatSms(t, callSid) {
