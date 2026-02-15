@@ -198,16 +198,16 @@ Reglas:
 
 function formatSms(t, callSid) {
   return [
-    "🛠️ AVISO URGENCIA (MARTA)\n" +
-    `Servicio: ${t?.servicio || "-"}\n` +
-    `Nombre: ${t?.nombre || "-"}\n` +
-    `Tel: ${t?.telefono || "-"}\n` +
-    `Dirección: ${t?.direccion || "-"}\n` +
-    `Zona: ${t?.zona || "-"}\n` +
-    `Urgente: ${t?.urgente || "-"}\n` +
-    `Acepto nocturno: ${t?.aceptoNocturno || "-"}\n` +
-    `Avería: ${t?.averia || "-"}\n` +
-    `Notas: ${t?.notas || "-"}\n` +
+    "🛠️ AVISO URGENCIA (MARTA)",
+    `Servicio: ${t?.servicio || "-"}`,
+    `Nombre: ${t?.nombre || "-"}`,
+    `Tel: ${t?.telefono || "-"}`,
+    `Dirección: ${t?.direccion || "-"}`,
+    `Zona: ${t?.zona || "-"}`,
+    `Urgente: ${t?.urgente || "-"}`,
+    `Acepto nocturno: ${t?.aceptoNocturno || "-"}`,
+    `Avería: ${t?.averia || "-"}`,
+    `Notas: ${t?.notas || "-"}`,
     callSid ? `CallSid: ${callSid}` : ""
   ]
     .filter(Boolean)
@@ -225,6 +225,7 @@ wss.on("connection", (twilioWs) => {
   let fromNumber = "";
   let transcript = "";
   let hasAudioSinceCommit = false;
+  let framesSinceCommit = 0; // 1 frame ~20ms
   let inAssistantText = false;
 
   let openaiReady = false;
@@ -306,18 +307,22 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "response.done") responseInFlight = false;
     
     if (msg.type === "input_audio_buffer.speech_stopped") {
-      // Evita el error buffer vacío
+      // Evita commit vacío / demasiado corto (<100ms aprox)
       if (!hasAudioSinceCommit) return;
+      if (framesSinceCommit < 5) return;
 
       openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       hasAudioSinceCommit = false;
+      framesSinceCommit = 0;
 
       // Si no hay respuesta en vuelo, pide a Marta que responda
       if (!responseInFlight) {
-        openaiWs.send(JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio", "text"] }
-        }));
+        openaiWs.send(
+          JSON.stringify({
+            type: "response.create",
+            response: { modalities: ["audio", "text"] }
+          })
+        );
       }
     }
 
@@ -405,6 +410,8 @@ wss.on("connection", (twilioWs) => {
 
     if (data.event === "media") {
       hasAudioSinceCommit = true;
+      framesSinceCommit++;
+
       if (openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.send(
           JSON.stringify({
@@ -420,10 +427,11 @@ wss.on("connection", (twilioWs) => {
       console.log("📦 TRANSCRIPT FINAL:\n", transcript);
       console.log("🛑 Twilio stop", { callSid, streamSid });
       // 🔴 Commit final por si quedó audio sin cerrar
-      if (hasAudioSinceCommit) {
+      if (hasAudioSinceCommit && framesSinceCommit >= 5) {
         openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-        hasAudioSinceCommit = false;
       }
+      hasAudioSinceCommit = false;
+      framesSinceCommit = 0;
       
       // ⏳ Espera a que OpenAI termine de mandar la última transcripción
       setTimeout(async () => {
