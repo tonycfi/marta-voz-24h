@@ -280,6 +280,7 @@ wss.on("connection", (twilioWs) => {
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           turn_detection: { type: "semantic_vad" },
+          input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           temperature: 0.7
         }
       })
