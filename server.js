@@ -246,6 +246,7 @@ wss.on("connection", (twilioWs) => {
   let streamSid = "";
   let fromNumber = "";
   let transcript = "";
+  let hasAudioSinceCommit = false;
   let inAssistantText = false;
 
   let openaiReady = false;
@@ -325,6 +326,22 @@ wss.on("connection", (twilioWs) => {
     
     if (msg.type === "response.created") responseInFlight = true;
     if (msg.type === "response.done") responseInFlight = false;
+    
+    if (msg.type === "input_audio_buffer.speech_stopped") {
+      // Evita el error buffer vacío
+      if (!hasAudioSinceCommit) return;
+
+      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      hasAudioSinceCommit = false;
+
+      // Si no hay respuesta en vuelo, pide a Marta que responda
+      if (!responseInFlight) {
+        openaiWs.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] }
+        }));
+      }
+    }
 
     // Captura transcripción del cliente (si llega)
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
@@ -334,9 +351,6 @@ wss.on("connection", (twilioWs) => {
         transcript += `CLIENTE: ${t}\n`;
       }
     }
-    
-    if (msg.type === "response.output_text.delta") { ... }
-    if (msg.type === "response.output_text.done") { ... }
     
     if (msg.type === "response.output_text.delta") {
       const t = msg.delta || "";
@@ -412,6 +426,7 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (data.event === "media") {
+      hasAudioSinceCommit = true;
       if (openaiWs.readyState === WebSocket.OPEN) {
         openaiWs.send(
           JSON.stringify({
@@ -426,65 +441,80 @@ wss.on("connection", (twilioWs) => {
     if (data.event === "stop") {
       console.log("📦 TRANSCRIPT FINAL:\n", transcript);
       console.log("🛑 Twilio stop", { callSid, streamSid });
-
-      // Si no hubo transcripción, mandamos fallback
-      let smsBody = "";
-      try {
-        if (!transcript.trim()) {
-          transcript = "SIN TRANSCRIPCIÓN: no se recibió texto del cliente/IA.\n";
-        }
-        const extracted = await extractTicket({ transcript, night });
-
-        if (!extracted) {
-          smsBody = [
-            "🛠️ AVISO URGENCIA (MARTA)",
-            "Servicio: -",
-            "Nombre: -",
-            "Tel: -",
-            "Dirección: -",
-            "Zona: -",
-            "Urgente: -",
-            `Acepto nocturno: ${night ? "-" : "n-a"}`,
-            "Avería: -",
-            `Notas: Sin transcripción (posible fallo de audio).`,
-            callSid ? `CallSid: ${callSid}` : ""
-          ]
-            .filter(Boolean)
-            .join("\n");
-        } else {
-          smsBody = formatSms(extracted, callSid);
-        }
-
-        await sendSms(process.env.ALERT_TO_NUMBER, smsBody);
-        console.log("✅ SMS enviado");
-      } catch (e) {
-        console.error("❌ Error enviando SMS", e);
-        // fallback de emergencia con transcript
-        try {
-          const fallback = [
-            "🛠️ AVISO URGENCIA (MARTA)",
-            "Servicio: -",
-            "Nombre: -",
-            "Tel: -",
-            "Dirección: -",
-            "Zona: -",
-            "Urgente: -",
-            `Acepto nocturno: ${night ? "-" : "n-a"}`,
-            "Avería: -",
-            `Notas: Error generando parte.`,
-            callSid ? `CallSid: ${callSid}` : "",
-            transcript ? `\nTRANSCRIPCIÓN:\n${transcript}` : ""
-          ]
-            .filter(Boolean)
-            .join("\n");
-
-          await sendSms(process.env.ALERT_TO_NUMBER, fallback);
-        } catch {}
-      } finally {
-        try {
-          openaiWs.close();
-        } catch {}
+      // 🔴 Commit final por si quedó audio sin cerrar
+      if (hasAudioSinceCommit) {
+        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+        hasAudioSinceCommit = false;
       }
+      
+      // ⏳ Espera a que OpenAI termine de mandar la última transcripción
+      setTimeout(async () => {
+
+        // Si no hubo transcripción, mandamos fallback
+        let smsBody = "";
+        try {
+          if (!transcript.trim()) {
+            transcript = "SIN TRANSCRIPCIÓN: no se recibió texto del cliente/IA.\n";
+          }
+          const extracted = await extractTicket({ transcript, night });
+
+          if (!extracted) {
+            smsBody = [
+              "🛠️ AVISO URGENCIA (MARTA)",
+              "Servicio: -",
+              "Nombre: -",
+              "Tel: -",
+              "Dirección: -",
+              "Zona: -",
+              "Urgente: -",
+              `Acepto nocturno: ${night ? "-" : "n-a"}`,
+              "Avería: -",
+              `Notas: Sin transcripción (posible fallo de audio).`,
+              callSid ? `CallSid: ${callSid}` : ""
+            ]
+              .filter(Boolean)
+              .join("\n");
+          } else {
+            smsBody = formatSms(extracted, callSid);
+          }
+
+          await sendSms(process.env.ALERT_TO_NUMBER, smsBody);
+          console.log("✅ SMS enviado");
+        } catch (e) {
+          console.error("❌ Error enviando SMS", e);
+          // fallback de emergencia con transcript
+          try {
+            const fallback = [
+              "🛠️ AVISO URGENCIA (MARTA)",
+              "Servicio: -",
+              "Nombre: -",
+              "Tel: -",
+              "Dirección: -",
+              "Zona: -",
+              "Urgente: -",
+              `Acepto nocturno: ${night ? "-" : "n-a"}`,
+              "Avería: -",
+              `Notas: Error generando parte.`,
+              callSid ? `CallSid: ${callSid}` : "",
+              transcript ? `\nTRANSCRIPCIÓN:\n${transcript}` : ""
+            ]
+              .filter(Boolean)
+              .join("\n");
+
+            await sendSms(process.env.ALERT_TO_NUMBER, fallback);
+          } catch {}
+        } finally {
+          try {
+            openaiWs.close();
+          } catch {}
+        }// <-- AQUÍ VA TODO TU BLOQUE ACTUAL:
+        // extractTicket + formatSms + sendSms + fallback + try/catch
+
+      }, 1200);
+
+      return;
+
+      
     }
   });
 
