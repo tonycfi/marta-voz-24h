@@ -195,8 +195,26 @@ ${transcript || ""}
     // raro, pero por si acaso
     return null;
   }
-
-  const out = (json.output_text || "").trim();
+  
+  function getResponseText(respJson) {
+    if (!respJson) return "";
+    if (typeof respJson.output_text === "string" && respJson.output_text.trim()) {
+      return respJson.output_text.trim();
+    }
+    const out = respJson.output;
+    if (!Array.isArray(out)) return "";
+    let acc = "";
+    for (const item of out) {
+      const content = item?.content;
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (c?.type === "output_text" && typeof c?.text === "string") acc += c.text;
+        if (c?.type === "text" && typeof c?.text === "string") acc += c.text;
+      }
+    }
+    return acc.trim();
+  }
+  const out = getResponseText(json);
   return safeJsonParse(out);
 }
 
@@ -233,6 +251,7 @@ wss.on("connection", (twilioWs) => {
   let openaiReady = false;
   let twilioReady = false;
   let greeted = false;
+  let responseInFlight = false;
 
   console.log("📞 Twilio WS conectado");
 
@@ -256,6 +275,8 @@ wss.on("connection", (twilioWs) => {
     greeted = true;
 
     console.log("👋 Enviando saludo de Marta");
+    
+    if (responseInFlight) return;
 
     openaiWs.send(
       JSON.stringify({
@@ -301,12 +322,27 @@ wss.on("connection", (twilioWs) => {
     } catch {
       return;
     }
+    
+    console.log("📝 TRANSCRIPT CLIENTE:", t);
+    
+    if (msg.type === "response.created") responseInFlight = true;
+    if (msg.type === "response.done") responseInFlight = false;
 
     // Captura transcripción del cliente (si llega)
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = msg.transcript || "";
-      if (t) transcript += `CLIENTE: ${t}\n`;
-    }
+      if (t) {
+        transcript += `CLIENTE: ${t}\n`;
+      
+       // 🚀 Responder SOLO cuando ya hay texto del cliente
+       if (!responseInFlight) {
+         openaiWs.send(JSON.stringify({
+           type: "response.create",
+           response: { modalities: ["audio", "text"] }
+         }));
+       }
+     }
+   }
     
     if (msg.type === "response.output_text.delta") {
       const t = msg.delta || "";
@@ -392,6 +428,8 @@ wss.on("connection", (twilioWs) => {
       }
       return;
     }
+    
+    console.log("📦 TRANSCRIPT FINAL:\n", transcript);
 
     if (data.event === "stop") {
       console.log("🛑 Twilio stop", { callSid, streamSid });
