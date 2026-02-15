@@ -200,16 +200,16 @@ ${transcript || ""}
 
 function formatSms(t, callSid) {
   return [
-    "🛠️ AVISO URGENCIA (MARTA)",
-    `Servicio: ${t?.servicio || "-"}`,
-    `Nombre: ${t?.nombre || "-"}`,
-    `Tel: ${t?.telefono || "-"}`,
-    `Dirección: ${t?.direccion || "-"}`,
-    `Zona: ${t?.zona || "-"}`,
-    `Urgente: ${t?.urgente || "-"}`,
-    `Acepto nocturno: ${t?.aceptoNocturno || "-"}`,
-    `Avería: ${t?.averia || "-"}`,
-    `Notas: ${t?.notas || "-"}`,
+    "🛠️ AVISO URGENCIA (MARTA)\n" +
+    `Servicio: ${t?.servicio || "-"}\n` +
+    `Nombre: ${t?.nombre || "-"}\n` +
+    `Tel: ${t?.telefono || "-"}\n` +
+    `Dirección: ${t?.direccion || "-"}\n` +
+    `Zona: ${t?.zona || "-"}\n` +
+    `Urgente: ${t?.urgente || "-"}\n` +
+    `Acepto nocturno: ${t?.aceptoNocturno || "-"}\n` +
+    `Avería: ${t?.averia || "-"}\n` +
+    `Notas: ${t?.notas || "-"}\n` +
     callSid ? `CallSid: ${callSid}` : ""
   ]
     .filter(Boolean)
