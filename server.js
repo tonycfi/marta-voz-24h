@@ -12,17 +12,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 10000;
 const TZ = process.env.TIMEZONE || "Europe/Madrid";
 
-// ====== Twilio ======
+// --- Twilio ---
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Falta variable de entorno: ${name}`);
-  return v;
-}
-
 function escapeXml(str = "") {
-  return str
+  return String(str)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
@@ -30,13 +24,17 @@ function escapeXml(str = "") {
     .replaceAll("'", "&apos;");
 }
 
-async function sendSms(to, body) {
-  const from = requireEnv("TWILIO_SMS_FROM");
+async function sendSms(body) {
+  const from = process.env.TWILIO_SMS_FROM;
+  const to = process.env.ALERT_TO_NUMBER;
+  if (!from) throw new Error("Falta TWILIO_SMS_FROM");
+  if (!to) throw new Error("Falta ALERT_TO_NUMBER");
+
   return twilioClient.messages.create({ from, to, body });
 }
 
-// ====== Hora local (España) sin librerías ======
-function getMadridInfo() {
+function nowInTZ() {
+  // Render suele ir en UTC; convertimos a Europe/Madrid (o el que pongas)
   const parts = new Intl.DateTimeFormat("en-GB", {
     timeZone: TZ,
     year: "numeric",
@@ -45,92 +43,28 @@ function getMadridInfo() {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
-    hour12: false
+    hour12: false,
   }).formatToParts(new Date());
 
   const get = (type) => parts.find((p) => p.type === type)?.value || "00";
-  const hour = Number(get("hour"));
+  // YYYY-MM-DDTHH:mm:ss
   const isoLike = `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
-
-  const esNoche = hour >= 22 || hour < 8;
-  const parteDelDia = hour >= 8 && hour < 14 ? "mañana" : hour >= 14 && hour < 22 ? "tarde" : "noche";
-
-  return { hour, esNoche, parteDelDia, isoLike };
+  return new Date(isoLike);
 }
 
-// ====== Página de prueba ======
-app.get("/", (req, res) => res.send("Marta 24h está viva ✅"));
-
-// ====== Webhook de llamada entrante ======
-app.post("/voice", (req, res) => {
-  const host = req.get("host");
-  const wsUrl = `wss://${host}/twilio-media`;
-
-  // IMPORTANTE: NO pongas track="both_tracks" (da error en Twilio)
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${escapeXml(wsUrl)}" />
-  </Connect>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
-});
-
-// ====== Servidor HTTP + WS ======
-const server = app.listen(PORT, () => console.log("Listening on", PORT));
-const wss = new WebSocketServer({ server, path: "/twilio-media" });
-
-// ====== Prompt (lo más importante) ======
-function buildInstructions({ esNoche, parteDelDia }) {
-  return `
-Eres "Marta", asistente de urgencias de "Reparaciones Express 24h Costa del Sol".
-Hablas SIEMPRE en español (neutro), tono profesional, rápido y empático.
-
-PROHIBIDO:
-- NO busques técnicos externos.
-- NO digas "te busco uno cerca".
-- NO recomiendes servicios de terceros.
-SIEMPRE debes decir que enviarás el aviso al técnico de guardia DE NUESTRA EMPRESA.
-
-OBJETIVO:
-Tomar datos y dejar un parte perfecto para enviar al técnico.
-
-Guion de apertura (debes decirlo tú al empezar, sin esperar al cliente):
-"Hola, soy Marta, el asistente de urgencias de Reparaciones Express 24h Costa del Sol. ¿En qué puedo ayudarte?"
-
-Datos a recoger (en este orden, preguntas cortas):
-1) Nombre
-2) Teléfono de contacto (confirmar si es el mismo desde el que llama)
-3) Dirección completa (calle, número, portal/piso/puerta si aplica)
-4) Zona/municipio (Costa del Sol)
-5) Tipo de servicio (elige 1): fontanería, electricidad, cerrajería, persianas, termo, aire acondicionado, electrodomésticos, pintura, mantenimiento
-6) Descripción breve de la avería
-7) ¿Es urgente o hay riesgo? (agua/fuego/personas atrapadas/niños/mayores)
-
-Regla nocturna:
-Si es entre 22:00 y 08:00 (hora España), di literalmente:
-"Te informo: entre las 22:00 y las 08:00 la salida para ver la avería son 70€, y después la mano de obra nocturna suele estar entre 50€ y 70€ por hora, según el trabajo. ¿Lo aceptas para enviar al técnico?"
-- Si NO acepta: toma nota y ofrece llamar en horario diurno.
-- Si SÍ acepta: continúa normal.
-
-Cierre obligatorio (siempre):
-"Perfecto. Voy a enviar el aviso al técnico de guardia ahora mismo y te llamará para confirmar disponibilidad y tiempo estimado."
-
-Despedida según parte del día:
-- mañana: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenos días, hasta luego."
-- tarde: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenas tardes, hasta luego."
-- noche: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buena noche, hasta luego."
-
-IMPORTANTE:
-- No leas el parte en voz alta.
-- Tu misión es recopilar datos. Si falta un dato, pregunta.
-Contexto: es_noche=${esNoche}, parte_del_dia=${parteDelDia}.
-`;
+function isNightWindow(dateObj) {
+  const h = dateObj.getHours();
+  return h >= 22 || h < 8;
 }
 
-// ====== Helper: SMS bonito ======
-function formatSms(t, callSid) {
+function dayPart(dateObj) {
+  const h = dateObj.getHours();
+  if (h >= 8 && h < 14) return "mañana";
+  if (h >= 14 && h < 22) return "tarde";
+  return "noche";
+}
+
+function formatSmsFromTicket(t, callSid) {
   return [
     "🛠️ AVISO URGENCIA (MARTA)",
     `Servicio: ${t.servicio || "-"}`,
@@ -142,125 +76,154 @@ function formatSms(t, callSid) {
     `Acepto nocturno: ${t.aceptoNocturno || "-"}`,
     `Avería: ${t.averia || "-"}`,
     `Notas: ${t.notas || "-"}`,
-    callSid ? `CallSid: ${callSid}` : ""
-  ].filter(Boolean).join("\n");
+    callSid ? `CallSid: ${callSid}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
-// ====== Extract con Responses API (SIN response_format; usa text.format) ======
-async function extractTicket({ transcript, esNoche }) {
-  const model = process.env.EXTRACT_MODEL || "gpt-4o-mini";
+// Página de prueba
+app.get("/", (_, res) => res.send("Marta voz activa ✅"));
 
-  const prompt = `
-Extrae un PARTE de servicio desde esta conversación (español).
-Devuelve SOLO JSON válido (sin texto extra).
+// Twilio Voice webhook
+app.post("/voice", (req, res) => {
+  const host = req.get("host");
+  const wsUrl = `wss://${host}/twilio-media`;
 
-Campos (strings):
-nombre, telefono, direccion, zona, servicio, averia, urgente, aceptoNocturno, notas
+  // IMPORTANTE: NO pongas track="both_tracks" aquí (Twilio da 31941 con <Connect>)
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${escapeXml(wsUrl)}" />
+  </Connect>
+</Response>`;
 
-Reglas:
-- servicio debe ser uno de:
-  fontanería | electricidad | cerrajería | persianas | termo | aire acondicionado | electrodomésticos | pintura | mantenimiento
-- urgente: "si" o "no"
-- aceptoNocturno:
-  - si es_noche=${esNoche} => "si" o "no" (si no se menciona, "no")
-  - si es_noche=false => "n-a"
-- Si falta un dato, deja "".
+  res.type("text/xml").send(twiml);
+});
 
-TRANSCRIPCIÓN:
-${transcript}
-`;
+// Servidor HTTP
+const server = app.listen(PORT, () => {
+  console.log("Listening on", PORT);
+});
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${requireEnv("OPENAI_API_KEY")}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model,
-      input: prompt,
-      // 👇 esto evita el error que viste: response_format -> ahora es text.format
-      text: { format: { type: "json_object" } }
-    })
-  });
+// WebSocket para Twilio Media Streams
+const wss = new WebSocketServer({ server, path: "/twilio-media" });
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`OpenAI extract failed: ${resp.status} ${text}`);
-  }
-
-  const json = await resp.json();
-  const out = (json.output_text || "").trim();
-  if (!out) throw new Error("OpenAI extract: output_text vacío");
-  return JSON.parse(out);
-}
-
-// ====== WebSocket: Twilio <-> OpenAI Realtime ======
 wss.on("connection", (twilioWs) => {
-  const { esNoche, parteDelDia } = getMadridInfo();
-  const instructions = buildInstructions({ esNoche, parteDelDia });
-
   let streamSid = "";
   let callSid = "";
-  let fromNumber = "";
   let transcript = "";
+  let martaText = "";
 
-  // Para que Marta hable SIEMPRE primero:
-  // guardamos audio de OpenAI hasta que Twilio nos dé streamSid
-  const pendingAudio = [];
+  const tNow = nowInTZ();
+  const night = isNightWindow(tNow);
+  const part = dayPart(tNow);
+
+  // Si OpenAI manda audio antes de que Twilio mande "start", lo guardamos aquí
+  const pendingOutboundAudio = [];
 
   console.log("📞 Twilio WS conectado");
 
   const realtimeModel = process.env.REALTIME_MODEL || "gpt-4o-realtime-preview-2025-06-03";
-  const voice = process.env.REALTIME_VOICE || "alloy";
+  const realtimeVoice = process.env.REALTIME_VOICE || "alloy";
 
+  // OpenAI Realtime WS
   const openaiWs = new WebSocket(`wss://api.openai.com/v1/realtime?model=${encodeURIComponent(realtimeModel)}`, {
     headers: {
-      Authorization: `Bearer ${requireEnv("OPENAI_API_KEY")}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "OpenAI-Beta": "realtime=v1",
+    },
   });
 
-  function sendAudioToTwilio(base64UlawChunk) {
-    if (!streamSid) {
-      pendingAudio.push(base64UlawChunk);
-      return;
-    }
-    twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: base64UlawChunk } }));
+  function safeSendToTwilio(payloadObj) {
+    if (twilioWs.readyState !== WebSocket.OPEN) return;
+    try {
+      twilioWs.send(JSON.stringify(payloadObj));
+    } catch {}
   }
 
   function flushPendingAudio() {
-    if (!streamSid || pendingAudio.length === 0) return;
-    for (const chunk of pendingAudio.splice(0, pendingAudio.length)) {
-      twilioWs.send(JSON.stringify({ event: "media", streamSid, media: { payload: chunk } }));
+    if (!streamSid) return;
+    while (pendingOutboundAudio.length) {
+      const b64 = pendingOutboundAudio.shift();
+      safeSendToTwilio({
+        event: "media",
+        streamSid,
+        media: { payload: b64 },
+      });
     }
   }
+
+  const BASE_INSTRUCTIONS = `
+Eres "Marta", asistente de urgencias de la empresa "Reparaciones Express 24h Costa del Sol".
+Hablas SIEMPRE en español neutro. Tono profesional, rápido, empático.
+
+MUY IMPORTANTE (PROHIBICIONES):
+- NO busques técnicos fuera de la empresa.
+- NO recomiendes profesionales externos.
+- NO uses internet ni “buscar cerca”.
+- Tu único objetivo es tomar datos y PASARLO al técnico de guardia de la empresa.
+
+Guion de apertura (MARTA HABLA PRIMERA, sin esperar "hola"):
+"Hola, soy Marta, el asistente de urgencias de Reparaciones Express 24h. ¿En qué puedo ayudarte?"
+
+Datos a recoger (en este orden, preguntas cortas, confirmando cada dato):
+1) Nombre
+2) Teléfono de contacto (confirmar si es el mismo desde el que llama)
+3) Dirección completa (calle, número, portal/piso si aplica)
+4) Zona/municipio (Costa del Sol)
+5) Tipo de servicio (elige 1): fontanería, electricidad, cerrajería, persianas, termo, aire acondicionado, electrodomésticos, pintura, mantenimiento
+6) Descripción breve de la avería
+7) ¿Es urgente? (si/no). ¿Hay riesgo? (agua/fuego/personas atrapadas)
+
+Regla nocturna:
+Si es entre 22:00 y 08:00 (hora España), di literalmente:
+"Te informo: entre las 22:00 y las 08:00 la salida para ver la avería son 70€, y después la mano de obra nocturna suele estar entre 50€ y 70€ por hora, según el trabajo. ¿Lo aceptas para enviar al técnico?"
+- Si acepta: marca aceptoNocturno=si.
+- Si no acepta: aceptoNocturno=no y ofrece dejarlo para horario diurno.
+
+Cierre obligatorio (SIEMPRE, sin hablar de buscar técnicos):
+"Perfecto. Voy a pasar ahora mismo los datos al técnico de guardia de nuestra empresa y te llamará o te enviará un mensaje para confirmar disponibilidad y tiempo estimado."
+
+Despedida según parte del día (${part}):
+- mañana: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenos días, hasta luego."
+- tarde: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenas tardes, hasta luego."
+- noche: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buena noche, hasta luego."
+
+NO leas el parte en voz alta. Solo conversas con el cliente.
+`;
 
   openaiWs.on("open", () => {
     console.log("🟢 OpenAI realtime conectado", { model: realtimeModel });
 
-    // Config session (Twilio usa g711_ulaw)
-    openaiWs.send(JSON.stringify({
-      type: "session.update",
-      session: {
-        instructions,
-        voice,
-        modalities: ["audio", "text"],
-        input_audio_format: "g711_ulaw",
-        output_audio_format: "g711_ulaw",
-        turn_detection: { type: "server_vad" },
-        temperature: 0.4
-      }
-    }));
+    // Config sesión: audio Twilio (mulaw), y habilitamos transcripción de entrada
+    openaiWs.send(
+      JSON.stringify({
+        type: "session.update",
+        session: {
+          voice: realtimeVoice,
+          modalities: ["audio", "text"],
+          input_audio_format: "g711_ulaw",
+          output_audio_format: "g711_ulaw",
+          turn_detection: { type: "server_vad" },
+          temperature: 0.4,
+          instructions: BASE_INSTRUCTIONS + `\nContexto: es_noche=${night}, parte_del_dia=${part}.`,
+          // Esto ayuda a que lleguen eventos de transcripción del cliente
+          input_audio_transcription: { model: process.env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe" },
+        },
+      })
+    );
 
-    // Marta debe hablar SIEMPRE primero
-    openaiWs.send(JSON.stringify({
-      type: "response.create",
-      response: {
-        modalities: ["audio", "text"],
-        instructions: `Empieza AHORA con el saludo exacto del guion. No esperes a que el cliente diga "hola".`
-      }
-    }));
+    // Marta habla PRIMERA
+    openaiWs.send(
+      JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions: 'Di exactamente: "Hola, soy Marta, el asistente de urgencias de Reparaciones Express 24h. ¿En qué puedo ayudarte?"',
+        },
+      })
+    );
   });
 
   openaiWs.on("message", (raw) => {
@@ -271,29 +234,50 @@ wss.on("connection", (twilioWs) => {
       return;
     }
 
-    // Audio de OpenAI -> Twilio
-    if (msg.type === "response.audio.delta" && msg.delta) {
-      sendAudioToTwilio(msg.delta);
+    // AUDIO de OpenAI -> Twilio
+    if (msg.type === "response.audio.delta") {
+      const b64 = msg.delta;
+
+      // Si todavía no llegó el start de Twilio con streamSid, lo guardamos
+      if (!streamSid) {
+        pendingOutboundAudio.push(b64);
+        return;
+      }
+
+      safeSendToTwilio({
+        event: "media",
+        streamSid,
+        media: { payload: b64 },
+      });
+      return;
     }
 
-    // Transcripción del cliente (si llega)
+    // Texto que dice Marta (por si quieres depurar)
+    if (msg.type === "response.output_text.delta") {
+      if (typeof msg.delta === "string") martaText += msg.delta;
+      return;
+    }
+
+    // Transcripción del CLIENTE
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = (msg.transcript || "").trim();
-      if (t) transcript += `\nCLIENTE: ${t}`;
+      if (t) {
+        transcript += `\nCLIENTE: ${t}`;
+      }
+      return;
     }
   });
 
   openaiWs.on("close", (code, reason) => {
     console.log("🔵 OpenAI realtime cerrado", { code, reason: String(reason || "") });
-    try { twilioWs.close(); } catch {}
+    try {
+      twilioWs.close();
+    } catch {}
   });
 
-  openaiWs.on("error", (e) => {
-    console.error("❌ OpenAI WS error", e?.message || e);
-    try { twilioWs.close(); } catch {}
-  });
+  openaiWs.on("error", (e) => console.error("❌ OpenAI WS error", e));
 
-  // Mensajes desde Twilio
+  // Mensajes desde Twilio (start/media/stop)
   twilioWs.on("message", async (raw) => {
     let data;
     try {
@@ -303,62 +287,123 @@ wss.on("connection", (twilioWs) => {
     }
 
     if (data.event === "start") {
-      callSid = data.start?.callSid || "";
       streamSid = data.start?.streamSid || "";
-      fromNumber = data.start?.customParameters?.From || "";
+      callSid = data.start?.callSid || "";
+      console.log("☎️ Twilio start", { callSid, streamSid });
 
-      console.log("☎️ Twilio start", { callSid, streamSid, fromNumber });
-      flushPendingAudio(); // 👈 clave para que Marta hable aunque su audio llegara antes del streamSid
+      // Ahora que ya tenemos streamSid, enviamos el audio pendiente (saludo)
+      flushPendingAudio();
+      return;
     }
 
     if (data.event === "media") {
       if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(JSON.stringify({
-          type: "input_audio_buffer.append",
-          audio: data.media.payload
-        }));
+        openaiWs.send(
+          JSON.stringify({
+            type: "input_audio_buffer.append",
+            audio: data.media?.payload,
+          })
+        );
       }
+      return;
     }
 
     if (data.event === "stop") {
       console.log("🛑 Twilio stop", { callSid, streamSid });
 
-      const alertTo = requireEnv("ALERT_TO_NUMBER");
-
+      // Cerramos realtime
       try {
-        let smsText = "";
+        openaiWs.close();
+      } catch {}
 
-        if (!transcript.trim()) {
-          smsText = [
-            "🛠️ AVISO URGENCIA (MARTA)",
-            "Notas: Sin transcripción (posible fallo de audio).",
-            callSid ? `CallSid: ${callSid}` : ""
-          ].filter(Boolean).join("\n");
-        } else {
-          const extracted = await extractTicket({ transcript, esNoche });
-          smsText = formatSms(extracted, callSid);
-        }
-
-        await sendSms(alertTo, smsText);
+      // Si no hay transcripción, aún así mandamos un SMS claro
+      try {
+        const extracted = await extractTicketToJson(transcript, night);
+        const smsText = formatSmsFromTicket(extracted, callSid);
+        await sendSms(smsText);
         console.log("✅ SMS enviado");
       } catch (e) {
-        console.error("❌ Error enviando SMS", e?.message || e);
+        console.error("❌ Error enviando SMS", e);
         try {
-          await sendSms(requireEnv("ALERT_TO_NUMBER"), `❌ Error generando parte (MARTA). CallSid: ${callSid || "-"}\n${String(e?.message || e)}`);
+          await sendSms(
+            transcript
+              ? "Transcripción de llamada:\n" + transcript
+              : "Llamada sin audio reconocido (posible fallo de transcripción)."
+          );
         } catch {}
-      } finally {
-        try { openaiWs.close(); } catch {}
       }
+
+      return;
     }
   });
 
-  twilioWs.on("close", () => {
-    console.log("🔌 Twilio WS cerrado");
-    try { openaiWs.close(); } catch {}
+  twilioWs.on("close", () => console.log("🔌 Twilio WS cerrado"));
+});
+
+// --- EXTRACCIÓN (Responses API) ---
+async function extractTicketToJson(transcript, night) {
+  const model = process.env.EXTRACT_MODEL || "gpt-4o-mini";
+
+  const prompt = `
+Extrae un PARTE de servicio desde la conversación. Devuelve SOLO JSON válido con estos campos:
+
+nombre (string),
+telefono (string),
+direccion (string),
+zona (string),
+servicio (string; uno de: fontanería/electricidad/cerrajería/persianas/termo/aire acondicionado/electrodomésticos/pintura/mantenimiento),
+averia (string),
+urgente (si/no),
+aceptoNocturno (si/no/n-a),
+notas (string)
+
+Reglas:
+- Si night=${night} entonces aceptoNocturno debe ser "si" o "no" según si aceptó el recargo. Si no se menciona, "no".
+- Si night=${night} es false, aceptoNocturno = "n-a".
+- Si falta un dato, pon string vacío "".
+- Si no hay transcripción útil, pon notas="Sin transcripción (posible fallo de audio)."
+
+CONVERSACIÓN:
+${transcript || "(sin transcripción)"}
+`;
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: prompt,
+      // 👇 IMPORTANTE: lo nuevo es text.format (evita el error de response_format)
+      text: { format: { type: "json_object" } },
+    }),
   });
 
-  twilioWs.on("error", (e) => {
-    console.error("❌ Twilio WS error", e?.message || e);
-    try { openaiWs.close(); } catch {}
-  });
-});
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`OpenAI extract failed: ${resp.status} ${text}`);
+  }
+
+  const json = await resp.json();
+  const out = (json.output_text || "").trim();
+
+  // Por seguridad, si por cualquier cosa viene vacío:
+  if (!out) {
+    return {
+      nombre: "",
+      telefono: "",
+      direccion: "",
+      zona: "",
+      servicio: "",
+      averia: "",
+      urgente: "",
+      aceptoNocturno: night ? "no" : "n-a",
+      notas: "Sin transcripción (posible fallo de audio).",
+    };
+  }
+
+  // output_text ya debería ser JSON válido
+  return JSON.parse(out);
+}
