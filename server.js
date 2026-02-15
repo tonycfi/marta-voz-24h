@@ -198,9 +198,11 @@ IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del
 
     // Audio hacia Twilio
     if (msg.type === "response.audio.delta") {
+      if (!streamSid) return; // aún no tenemos streamSid
       twilioWs.send(
         JSON.stringify({
           event: "media",
+          streamSid,                 // 👈 CLAVE
           media: { payload: msg.delta }
         })
       );
@@ -228,6 +230,7 @@ IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del
 
     if (data.event === "start") {
       callSid = data.start?.callSid || "";
+      streamSid = data.start?.streamSid || ""; 
       fromNumber = data.start?.customParameters?.From || ""; // a veces no viene aquí
     }
 
