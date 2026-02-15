@@ -93,11 +93,14 @@ wss.on("connection", (twilioWs) => {
   let callSid = "";
   let fromNumber = "";
 
+  // transcript solo del cliente (para el SMS)
   let transcript = "";
-  let greeted = false;
 
+  // Control para evitar bucles / solapamientos
+  let greeted = false;
   let sessionReady = false;
-  let openaiConnected = false;
+  let awaitingAssistant = false;
+  let assistantTextBuffer = "";
 
   console.log("📞 Twilio WS conectado");
 
@@ -111,19 +114,20 @@ wss.on("connection", (twilioWs) => {
     }
   });
 
+  // ✅ Instrucciones: sin "buscar técnicos", sin "riesgos", sin repetir saludo.
+  // Importante: como vamos en modo MANUAL, Marta solo habla cuando nosotros pedimos response.create.
   const baseInstructions = `
 Eres "Marta", asistente de urgencias de "Reparaciones Express 24h Costa del Sol".
 Hablas SIEMPRE en español neutro. Tono profesional, rápido y empático.
 
-IMPORTANTE:
-- NO busques técnicos externos.
-- NO digas "te busco uno cerca" ni nada parecido.
-- SIEMPRE di que pasarás el aviso a NUESTRO técnico de guardia.
+PROHIBIDO:
+- No busques técnicos externos.
+- No digas "te busco uno cerca", "te recomiendo alguien", "según tu ubicación", etc.
+- No repitas el saludo nunca (solo una vez al principio).
+- No preguntes por "riesgos". Solo pregunta si es urgente (sí/no).
 
-Guion de apertura (dilo tal cual):
-"Hola, soy Marta, el asistente de urgencias de Reparaciones Express 24h Costa del Sol. ¿En qué puedo ayudarte?"
-
-Datos a recoger (en este orden, 1 pregunta cada vez):
+OBJETIVO:
+Recoger estos datos EN ESTE ORDEN (una pregunta corta cada vez):
 1) Nombre
 2) Teléfono de contacto (confirmar si es el mismo desde el que llama)
 3) Dirección completa
@@ -132,73 +136,132 @@ Datos a recoger (en este orden, 1 pregunta cada vez):
    fontanería, electricidad, cerrajería, persianas, termo/agua caliente,
    aire acondicionado, electrodomésticos, pintura, mantenimiento
 6) Descripción breve de la avería
-7) ¿Es urgente o hay riesgo? (agua/fuego/personas atrapadas) => urgente si/no
+7) ¿Es urgente? (sí/no)
 
-Regla nocturna:
-Si es entre 22:00 y 08:00 (hora España), di literalmente:
+REGLA NOCTURNA:
+Si es noche (22:00-08:00 hora España), di literalmente (una sola vez, cuando toque enviar técnico):
 "Te informo: entre las 22:00 y las 08:00 la salida para ver la avería son 70€, y después la mano de obra nocturna suele estar entre 50€ y 70€ por hora, según el trabajo. ¿Lo aceptas para enviar al técnico?"
-Si no acepta, toma nota y sugiere llamar en horario diurno.
+Si no acepta, toma nota y di que pueden llamar en horario diurno.
 
-Cierre obligatorio (dilo tal cual):
+CIERRE OBLIGATORIO (cuando ya tengas los datos):
 "Perfecto. Voy a enviar el aviso al técnico de guardia ahora mismo y te llamará para confirmar disponibilidad y tiempo estimado."
 
-Despedida según parte del día:
+DESPEDIDA según parte del día:
 - mañana: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenos días, hasta luego."
 - tarde: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenas tardes, hasta luego."
 - noche: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buena noche, hasta luego."
+
+Cuando termines el cierre+despedida, añade EXACTAMENTE al final: [END_CALL]
+(esto es interno; el cliente lo oirá como texto normal, pero nos sirve para colgar).
 `;
 
-  function markReady(reason) {
-    if (sessionReady) return;
-    sessionReady = true;
-    console.log("✅ OpenAI session READY por:", reason);
-    startGreetingIfReady();
+  function sendAudioToTwilio(base64ulaw) {
+    if (!streamSid) return;
+    twilioWs.send(
+      JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: base64ulaw }
+      })
+    );
+  }
+
+  function maybeHangupIfEndCall(text) {
+    if (!callSid) return;
+    if (!text) return;
+    if (!text.includes("[END_CALL]")) return;
+
+    // Colgamos la llamada desde Twilio (para que no se quede abierta y evitar bucles)
+    try {
+      twilioClient.calls(callSid).update({ status: "completed" }).catch(() => {});
+    } catch {}
   }
 
   function startGreetingIfReady() {
     if (greeted) return;
     if (!streamSid) return;
-    if (openaiWs.readyState !== WebSocket.OPEN) return;
     if (!sessionReady) return;
+    if (openaiWs.readyState !== WebSocket.OPEN) return;
 
     greeted = true;
-    console.log("🗣️ Enviando saludo de Marta...");
+    awaitingAssistant = true;
+    assistantTextBuffer = "";
 
+    // ✅ Saludo EXACTO (tu punto 1)
     openaiWs.send(
       JSON.stringify({
         type: "response.create",
         response: {
           modalities: ["audio", "text"],
-          instructions: `Empieza con el saludo exacto del guion y espera respuesta. Contexto: es_noche=${night}, parte_del_dia=${part}.`
+          instructions:
+            'Di exactamente: "Hola, soy Marta, el asistente de urgencias de Reparaciones Express 24h Costa del Sol. ¿En qué puedo ayudarte?"'
+        }
+      })
+    );
+  }
+
+  function askNextStepAfterUserUtterance() {
+    if (openaiWs.readyState !== WebSocket.OPEN) return;
+    if (!sessionReady) return;
+    if (!greeted) return; // primero el saludo
+    if (awaitingAssistant) return; // evita solaparse
+
+    awaitingAssistant = true;
+    assistantTextBuffer = "";
+
+    // Le damos contexto con lo que el cliente ya dijo
+    openaiWs.send(
+      JSON.stringify({
+        type: "response.create",
+        response: {
+          modalities: ["audio", "text"],
+          instructions: `
+Sigue el guion y continúa la recogida de datos (sin repetir el saludo).
+Contexto horario: es_noche=${night}, parte_del_dia=${part}.
+Teléfono origen (si sirve para confirmar): ${fromNumber || "-"}.
+
+Conversación (solo cliente):
+${transcript}
+
+Ahora: formula SOLO la siguiente pregunta necesaria según lo que falte.
+Si ya tienes todo, haz cierre+despedida y termina con [END_CALL].
+`
         }
       })
     );
   }
 
   openaiWs.on("open", () => {
-    openaiConnected = true;
     console.log("🟢 OpenAI realtime conectado", { model: realtimeModel });
 
-    // ✅ TEMPERATURE >= 0.6 (si no, OpenAI rechaza la sesión)
+    // ✅ Evitamos el error de temperature (>= 0.6)
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
         session: {
-          instructions: `${baseInstructions}\nContexto horario: es_noche=${night}, parte_del_dia=${part}.`,
+          instructions: baseInstructions + `\nContexto horario: es_noche=${night}, parte_del_dia=${part}.`,
           voice,
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
           input_audio_transcription: { model: process.env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe" },
-          turn_detection: { type: "server_vad" },
+
+          // ✅ CLAVE ANTI-BUCLE: NO auto-turn. Nosotros mandamos response.create manualmente.
+          turn_detection: { type: "none" },
+
           temperature: 0.7
         }
       })
     );
 
+    // si por lo que sea no llega session.updated, no nos quedamos colgados
     setTimeout(() => {
-      if (!sessionReady && openaiConnected) markReady("fallback_1000ms");
-    }, 1000);
+      if (!sessionReady) {
+        sessionReady = true;
+        console.log("✅ OpenAI session READY (fallback)");
+        startGreetingIfReady();
+      }
+    }, 800);
   });
 
   openaiWs.on("message", (raw) => {
@@ -209,29 +272,47 @@ Despedida según parte del día:
       return;
     }
 
-    if (msg.type === "session.created") return markReady("session.created");
-    if (msg.type === "session.updated") return markReady("session.updated");
-
-    if (msg.type === "response.audio.delta") {
-      if (!streamSid) return;
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: msg.delta }
-        })
-      );
+    // ready signals
+    if (msg.type === "session.updated" || msg.type === "session.created") {
+      if (!sessionReady) {
+        sessionReady = true;
+        console.log("✅ OpenAI session READY por", msg.type);
+        startGreetingIfReady();
+      }
       return;
     }
 
+    // Audio hacia Twilio
+    if (msg.type === "response.audio.delta") {
+      sendAudioToTwilio(msg.delta);
+      return;
+    }
+
+    // Texto de Marta (para detectar [END_CALL])
+    if (msg.type === "response.output_text.delta") {
+      assistantTextBuffer += msg.delta || "";
+      maybeHangupIfEndCall(assistantTextBuffer);
+      return;
+    }
+
+    // Fin de respuesta del asistente -> ya podemos permitir siguiente turno
+    if (msg.type === "response.completed") {
+      awaitingAssistant = false;
+      // Si ha dicho END_CALL, colgaremos nosotros; si no, esperamos al usuario.
+      return;
+    }
+
+    // Transcripción del cliente
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = (msg.transcript || "").trim();
       if (t) transcript += `CLIENTE: ${t}\n`;
+      askNextStepAfterUserUtterance();
       return;
     }
 
     if (msg.type === "error") {
       console.error("❌ OpenAI error payload:", msg);
+      awaitingAssistant = false;
       return;
     }
   });
@@ -273,8 +354,26 @@ Despedida según parte del día:
       } catch (e) {
         console.error("❌ Error enviando SMS", e);
         try {
+          // fallback: siempre en líneas
           await sendSms(
-            `🛠️ AVISO URGENCIA (MARTA)\nNotas: Error generando parte.\nCallSid: ${callSid || "-"}\nTranscripción:\n${transcript || "(sin transcripción)"}`
+            [
+              "🛠️ AVISO URGENCIA (MARTA)",
+              "Servicio: -",
+              "Nombre: -",
+              `Tel: ${fromNumber || "-"}`,
+              "Dirección: -",
+              "Zona: -",
+              "Urgente: -",
+              "Acepto nocturno: -",
+              "Avería: -",
+              `Notas: Error generando parte.`,
+              callSid ? `CallSid: ${callSid}` : "",
+              "",
+              "Transcripción:",
+              transcript || "(sin transcripción)"
+            ]
+              .filter(Boolean)
+              .join("\n")
           );
         } catch {}
       } finally {
@@ -292,18 +391,52 @@ Despedida según parte del día:
 async function buildSmsFromTranscript(transcript, meta) {
   const { callSid, fromNumber, night } = meta;
 
-  if (!transcript || !transcript.trim()) {
-    return [
+  // ✅ Formato EXACTO en líneas (tu punto 3)
+  const emptySms = (notes) =>
+    [
       "🛠️ AVISO URGENCIA (MARTA)",
-      `Tel (origen): ${fromNumber || "-"}`,
-      "Notas: Sin transcripción (posible fallo de audio).",
+      "Servicio: -",
+      "Nombre: -",
+      `Tel: ${fromNumber || "-"}`,
+      "Dirección: -",
+      "Zona: -",
+      "Urgente: -",
+      "Acepto nocturno: -",
+      "Avería: -",
+      `Notas: ${notes}`,
       callSid ? `CallSid: ${callSid}` : ""
     ]
       .filter(Boolean)
       .join("\n");
+
+  if (!transcript || !transcript.trim()) {
+    return emptySms("Sin transcripción (posible fallo de audio).");
   }
 
-  const extracted = await extractTicket(transcript, night);
+  let extracted;
+  try {
+    extracted = await extractTicket(transcript, night);
+  } catch (e) {
+    // fallback con transcripción (para que nunca se pierda lo dicho)
+    return [
+      "🛠️ AVISO URGENCIA (MARTA)",
+      "Servicio: -",
+      "Nombre: -",
+      `Tel: ${fromNumber || "-"}`,
+      "Dirección: -",
+      "Zona: -",
+      "Urgente: -",
+      "Acepto nocturno: -",
+      "Avería: -",
+      "Notas: Error generando parte.",
+      callSid ? `CallSid: ${callSid}` : "",
+      "",
+      "Transcripción:",
+      transcript
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
 
   return [
     "🛠️ AVISO URGENCIA (MARTA)",
@@ -372,6 +505,7 @@ ${transcript}
   const json = await resp.json();
   const out = (json.output_text || "").trim();
 
+  // parse robusto
   const first = out.indexOf("{");
   const last = out.lastIndexOf("}");
   const candidate = first >= 0 && last >= 0 ? out.slice(first, last + 1) : out;
