@@ -95,6 +95,8 @@ MUY IMPORTANTE:
 - NO recomiendes servicios "cerca de su ubicación".
 - SIEMPRE: "Voy a pasar los datos al técnico de guardia..."
 - Haz SOLO una pregunta por turno y espera la respuesta del cliente antes de continuar.
+- Tras hacer una pregunta, NO hables más hasta que el cliente responda.
+- Si el cliente no responde, espera en silencio (no repitas el saludo).
 - Después de cada pregunta, quédate en silencio y NO enumeres la siguiente pregunta hasta oír respuesta.
 
 Servicios (elige uno): fontanería, electricidad, cerrajería, persianas, electrodomésticos, pintura, mantenimiento, aire acondicionado, termo, otro.
@@ -226,8 +228,7 @@ wss.on("connection", (twilioWs) => {
   let streamSid = "";
   let fromNumber = "";
   let transcript = "";
-  let assistantSpeaking = false;
-  let pendingUserTurn = false;
+  let inAssistantText = false;
 
   let openaiReady = false;
   let twilioReady = false;
@@ -281,7 +282,7 @@ wss.on("connection", (twilioWs) => {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          turn_detection: { type: "server_vad" },
+          turn_detection: { type: "semantic_vad" },
           input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           temperature: 0.7
         }
@@ -309,52 +310,18 @@ wss.on("connection", (twilioWs) => {
     
     if (msg.type === "response.output_text.delta") {
       const t = msg.delta || "";
-      if (t) transcript += `MARTA: ${t}`;
+      if (!t) return;
+
+      if (!inAssistantText) {
+        transcript += "MARTA: ";
+        inAssistantText = true;
+      }
+      transcript += t;
     }
+
     if (msg.type === "response.output_text.done") {
-      transcript += "\n";
-    }
-    
-    // Cuando la IA empieza a responder
-    if (msg.type === "response.created") {
-      assistantSpeaking = true;
-    }
-
-    // Cuando la IA termina su respuesta
-    if (msg.type === "response.done") {
-      assistantSpeaking = false;
-
-      // Si el usuario terminó de hablar mientras Marta hablaba,
-      // ahora generamos la respuesta pendiente.
-      if (pendingUserTurn) {
-        pendingUserTurn = false;
-
-        // Cierra el buffer para que salga la transcripción
-        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-        // Pide a Marta la siguiente respuesta (sin instrucciones nuevas)
-        openaiWs.send(JSON.stringify({
-          type: "response.create",
-          response: { modalities: ["audio", "text"] }
-        }));
-      }
-    }
-    
-    // Detecta cuando el cliente deja de hablar
-    if (msg.type === "input_audio_buffer.speech_stopped") {
-      // Si Marta está hablando, espera a que termine y luego respondes
-      if (assistantSpeaking) {
-        pendingUserTurn = true;
-        return;
-      }
-
-      // Si Marta NO está hablando, cerramos audio + pedimos respuesta
-      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-
-      openaiWs.send(JSON.stringify({
-        type: "response.create",
-        response: { modalities: ["audio", "text"] }
-      }));
+      if (inAssistantText) transcript += "\n";
+      inAssistantText = false;
     }
 
     // Audio OpenAI -> Twilio
@@ -432,6 +399,9 @@ wss.on("connection", (twilioWs) => {
       // Si no hubo transcripción, mandamos fallback
       let smsBody = "";
       try {
+        if (!transcript.trim()) {
+          transcript = "SIN TRANSCRIPCIÓN: no se recibió texto del cliente/IA.\n";
+        }
         const extracted = await extractTicket({ transcript, night });
 
         if (!extracted) {
