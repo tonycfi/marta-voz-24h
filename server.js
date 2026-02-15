@@ -226,6 +226,8 @@ wss.on("connection", (twilioWs) => {
   let streamSid = "";
   let fromNumber = "";
   let transcript = "";
+  let assistantSpeaking = false;
+  let pendingUserTurn = false;
 
   let openaiReady = false;
   let twilioReady = false;
@@ -279,7 +281,7 @@ wss.on("connection", (twilioWs) => {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          turn_detection: { type: "semantic_vad" },
+          turn_detection: { type: "server_vad" },
           input_audio_transcription: { model: "gpt-4o-mini-transcribe" },
           temperature: 0.7
         }
@@ -303,6 +305,56 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = msg.transcript || "";
       if (t) transcript += `CLIENTE: ${t}\n`;
+    }
+    
+    if (msg.type === "response.output_text.delta") {
+      const t = msg.delta || "";
+      if (t) transcript += `MARTA: ${t}`;
+    }
+    if (msg.type === "response.output_text.done") {
+      transcript += "\n";
+    }
+    
+    // Cuando la IA empieza a responder
+    if (msg.type === "response.created") {
+      assistantSpeaking = true;
+    }
+
+    // Cuando la IA termina su respuesta
+    if (msg.type === "response.done") {
+      assistantSpeaking = false;
+
+      // Si el usuario terminó de hablar mientras Marta hablaba,
+      // ahora generamos la respuesta pendiente.
+      if (pendingUserTurn) {
+        pendingUserTurn = false;
+
+        // Cierra el buffer para que salga la transcripción
+        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
+        // Pide a Marta la siguiente respuesta (sin instrucciones nuevas)
+        openaiWs.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] }
+        }));
+      }
+    }
+    
+    // Detecta cuando el cliente deja de hablar
+    if (msg.type === "input_audio_buffer.speech_stopped") {
+      // Si Marta está hablando, espera a que termine y luego respondes
+      if (assistantSpeaking) {
+        pendingUserTurn = true;
+        return;
+      }
+
+      // Si Marta NO está hablando, cerramos audio + pedimos respuesta
+      openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+
+      openaiWs.send(JSON.stringify({
+        type: "response.create",
+        response: { modalities: ["audio", "text"] }
+      }));
     }
 
     // Audio OpenAI -> Twilio
