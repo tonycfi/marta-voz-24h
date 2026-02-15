@@ -66,8 +66,6 @@ app.get("/", (_, res) => res.send("Marta voz activa ✅"));
 // --- Twilio Voice webhook ---
 app.post("/voice", (req, res) => {
   const host = req.get("host");
-
-  // No usamos track=... (te daba "Invalid Track configuration")
   const wsUrl = `wss://${host}/twilio-media`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -98,7 +96,6 @@ wss.on("connection", (twilioWs) => {
   let transcript = "";
   let greeted = false;
 
-  // READY si llega session.created/updated, o por fallback en 1s
   let sessionReady = false;
   let openaiConnected = false;
 
@@ -160,7 +157,7 @@ Despedida según parte del día:
 
   function startGreetingIfReady() {
     if (greeted) return;
-    if (!streamSid) return; // sin streamSid no mandamos audio a Twilio
+    if (!streamSid) return;
     if (openaiWs.readyState !== WebSocket.OPEN) return;
     if (!sessionReady) return;
 
@@ -182,7 +179,7 @@ Despedida según parte del día:
     openaiConnected = true;
     console.log("🟢 OpenAI realtime conectado", { model: realtimeModel });
 
-    // Config de sesión
+    // ✅ TEMPERATURE >= 0.6 (si no, OpenAI rechaza la sesión)
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
@@ -194,12 +191,11 @@ Despedida según parte del día:
           output_audio_format: "g711_ulaw",
           input_audio_transcription: { model: process.env.TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe" },
           turn_detection: { type: "server_vad" },
-          temperature: 0.4
+          temperature: 0.7
         }
       })
     );
 
-    // ✅ Fallback: si no llega session.created/updated, a los 1000ms lo damos por ready
     setTimeout(() => {
       if (!sessionReady && openaiConnected) markReady("fallback_1000ms");
     }, 1000);
@@ -213,23 +209,11 @@ Despedida según parte del día:
       return;
     }
 
-    // 🔎 (Opcional) si quieres ver el tipo de eventos:
-    // console.log("OpenAI msg.type:", msg.type);
+    if (msg.type === "session.created") return markReady("session.created");
+    if (msg.type === "session.updated") return markReady("session.updated");
 
-    if (msg.type === "session.created") {
-      markReady("session.created");
-      return;
-    }
-    if (msg.type === "session.updated") {
-      markReady("session.updated");
-      return;
-    }
-
-    // Audio OpenAI -> Twilio
     if (msg.type === "response.audio.delta") {
       if (!streamSid) return;
-      // Log muy ligero (si quieres: comenta la línea)
-      // console.log("🔊 audio.delta -> Twilio");
       twilioWs.send(
         JSON.stringify({
           event: "media",
@@ -240,14 +224,12 @@ Despedida según parte del día:
       return;
     }
 
-    // Transcripción del cliente
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = (msg.transcript || "").trim();
       if (t) transcript += `CLIENTE: ${t}\n`;
       return;
     }
 
-    // Si OpenAI responde con error
     if (msg.type === "error") {
       console.error("❌ OpenAI error payload:", msg);
       return;
@@ -257,7 +239,6 @@ Despedida según parte del día:
   openaiWs.on("close", () => console.log("🔵 OpenAI realtime cerrado"));
   openaiWs.on("error", (e) => console.error("❌ OpenAI WS error", e));
 
-  // Twilio events
   twilioWs.on("message", async (raw) => {
     let data;
     try {
@@ -270,22 +251,14 @@ Despedida según parte del día:
       streamSid = data.start?.streamSid || "";
       callSid = data.start?.callSid || "";
       fromNumber = data.start?.customParameters?.From || "";
-
       console.log("☎️ Twilio start", { callSid, streamSid, fromNumber });
-
-      // Si ya está ready, saluda ya
       startGreetingIfReady();
       return;
     }
 
     if (data.event === "media") {
       if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(
-          JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: data.media.payload
-          })
-        );
+        openaiWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: data.media.payload }));
       }
       return;
     }
