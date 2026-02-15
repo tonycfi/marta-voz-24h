@@ -93,9 +93,11 @@ Hablas SIEMPRE en español neutro. Tono profesional, rápido y empático.
 MUY IMPORTANTE:
 - NO busques técnicos externos.
 - NO recomiendes servicios "cerca de su ubicación".
-- SIEMPRE: "Voy a pasar los datos al técnico de guardia de nuestra empresa y te llamará para confirmar disponibilidad y tiempo estimado."
+- SIEMPRE: "Voy a pasar los datos al técnico de guardia..."
+- Haz SOLO una pregunta por turno y espera la respuesta del cliente antes de continuar.
+- Después de cada pregunta, quédate en silencio y NO enumeres la siguiente pregunta hasta oír respuesta.
 
-Servicios (elige uno): fontanería, electricidad, cerrajería, persianas, electrodomésticos, pintura, mantenimiento, aire acondicionado, termo.
+Servicios (elige uno): fontanería, electricidad, cerrajería, persianas, electrodomésticos, pintura, mantenimiento, aire acondicionado, termo, otro.
 
 Guion de apertura EXACTO (lo dices tal cual):
 "Hola, soy Marta, el asistente de urgencias de Reparaciones Express 24h Costa del Sol. ¿En qué puedo ayudarte?"
@@ -277,7 +279,7 @@ wss.on("connection", (twilioWs) => {
           modalities: ["audio", "text"],
           input_audio_format: "g711_ulaw",
           output_audio_format: "g711_ulaw",
-          turn_detection: { type: "server_vad" },
+          turn_detection: { type: "semantic_vad" },
           temperature: 0.7
         }
       })
