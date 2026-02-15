@@ -92,11 +92,11 @@ app.post("/voice", (req, res) => {
   const wsUrl = `wss://${host}/twilio-media`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${escapeXml(wsUrl)}" track="both_tracks" />
-  </Connect>
-</Response>`;
+    <Response>
+      <Connect>
+        <Stream url="${escapeXml(wsUrl)}" track="inbound_track" />
+      </Connect>
+    </Response>`;
 
   res.type("text/xml").send(twiml);
 });
