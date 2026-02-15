@@ -12,17 +12,26 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const TZ = process.env.TIMEZONE || "Europe/Madrid";
 
+// ---- Validaciones mínimas al arrancar (te ahorra horas) ----
+function must(name) {
+  if (!process.env[name]) {
+    console.error(`❌ Falta variable de entorno: ${name}`);
+  }
+}
+must("OPENAI_API_KEY");
+must("TWILIO_ACCOUNT_SID");
+must("TWILIO_AUTH_TOKEN");
+must("TWILIO_SMS_FROM");
+must("ALERT_TO_NUMBER");
+
 // --- Twilio SMS client ---
-const twilioClient = twilio(
-  process.env.TWILIO_ACCOUNT_SID,
-  process.env.TWILIO_AUTH_TOKEN
-);
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 // --- helpers ---
-function nowInTZ(timeZone) {
-  // Crea una fecha "equivalente" en la TZ dada usando formatToParts (sin parseos raros)
+function nowInTZ() {
+  // devuelve fecha “en esa zona horaria”, pero como Date.
   const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone,
+    timeZone: TZ,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
@@ -32,25 +41,18 @@ function nowInTZ(timeZone) {
     hour12: false
   }).formatToParts(new Date());
 
-  const get = (type) => parts.find((p) => p.type === type)?.value || "00";
-  const y = get("year");
-  const mo = get("month");
-  const d = get("day");
-  const h = get("hour");
-  const mi = get("minute");
-  const s = get("second");
-
-  // ISO “local” (sin Z) — suficiente para reglas horario
-  return new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}`);
+  const map = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  // Construimos un ISO “falso” pero consistente
+  return new Date(`${map.year}-${map.month}-${map.day}T${map.hour}:${map.minute}:${map.second}.000Z`);
 }
 
 function isNightWindow(dateObj) {
-  const h = dateObj.getHours();
-  return h >= 22 || h < 8; // 22:00-08:00
+  const h = dateObj.getUTCHours(); // ojo: dateObj ya está “convertido” arriba
+  return h >= 22 || h < 8;
 }
 
 function dayPart(dateObj) {
-  const h = dateObj.getHours();
+  const h = dateObj.getUTCHours();
   if (h >= 8 && h < 14) return "mañana";
   if (h >= 14 && h < 22) return "tarde";
   return "noche";
@@ -67,33 +69,19 @@ function escapeXml(str = "") {
 
 async function sendSms(to, body) {
   const from = process.env.TWILIO_SMS_FROM;
-  if (!from) throw new Error("Falta TWILIO_SMS_FROM");
-  if (!to) throw new Error("Falta ALERT_TO_NUMBER (destino del SMS)");
   return twilioClient.messages.create({ from, to, body });
-}
-
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    // intenta rescatar el primer bloque {...}
-    const m = text.match(/\{[\s\S]*\}/);
-    if (m) return JSON.parse(m[0]);
-    throw new Error("No pude parsear JSON desde OpenAI");
-  }
 }
 
 // Página de prueba
 app.get("/", (req, res) => res.send("Marta 24h está viva ✅"));
-app.get("/health", (req, res) => res.json({ ok: true }));
 
-// ✅ IMPORTANTE: Twilio llama por POST a /voice.
-// Si lo abres en navegador con GET verás "Cannot GET /voice" y es NORMAL.
+// ✅ Webhook de llamada -> TwiML -> Media Stream a nuestro WS
 app.post("/voice", (req, res) => {
-  const host = req.get("host");
+  // Render suele pasar por proxy: preferimos x-forwarded-host si existe
+  const host = req.headers["x-forwarded-host"] || req.get("host");
   const wsUrl = `wss://${host}/twilio-media`;
 
-  // ✅ QUITAMOS track="both_tracks" (te daba 31941Stream)
+  // ✅ CLAVE: NO usar track="both_tracks" (te daba 31941)
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -104,12 +92,45 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
+// --- Estado / ticket ---
+function newTicket() {
+  return {
+    nombre: "",
+    telefono: "",
+    direccion: "",
+    zona: "",
+    servicio: "",
+    averia: "",
+    urgente: "",
+    aceptoNocturno: "n-a",
+    notas: ""
+  };
+}
+
+function formatSms(t, callSid) {
+  return [
+    "🛠️ AVISO URGENCIA (MARTA)",
+    `Servicio: ${t.servicio || "-"}`,
+    `Nombre: ${t.nombre || "-"}`,
+    `Tel: ${t.telefono || "-"}`,
+    `Dirección: ${t.direccion || "-"}`,
+    `Zona: ${t.zona || "-"}`,
+    `Urgente: ${t.urgente || "-"}`,
+    `Acepto nocturno: ${t.aceptoNocturno || "-"}`,
+    `Avería: ${t.averia || "-"}`,
+    `Notas: ${t.notas || "-"}`,
+    callSid ? `CallSid: ${callSid}` : ""
+  ].filter(Boolean).join("\n");
+}
+
 // 2) WebSocket server para Twilio Media Streams
-const server = app.listen(PORT, () => console.log("Listening on", PORT));
+const server = app.listen(PORT, () => console.log("✅ Listening on", PORT));
 const wss = new WebSocketServer({ server, path: "/twilio-media" });
 
 wss.on("connection", (twilioWs) => {
-  const tNow = nowInTZ(TZ);
+  console.log("🔌 Twilio WS conectado");
+
+  const tNow = nowInTZ();
   const night = isNightWindow(tNow);
   const part = dayPart(tNow);
 
@@ -117,20 +138,8 @@ wss.on("connection", (twilioWs) => {
   let streamSid = "";
   let transcript = "";
 
-  const REALTIME_MODEL =
-    process.env.REALTIME_MODEL || "gpt-4o-realtime-preview-2025-06-03"; // ejemplo válido  [oai_citation:1‡OpenAI Developers](https://developers.openai.com/blog/realtime-api/?utm_source=chatgpt.com)
+  const REALTIME_MODEL = process.env.REALTIME_MODEL || "gpt-4o-realtime-preview";
   const REALTIME_VOICE = process.env.REALTIME_VOICE || "alloy";
-
-  // Conexión a OpenAI Realtime
-  const openaiWs = new WebSocket(
-    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-        "OpenAI-Beta": "realtime=v1"
-      }
-    }
-  );
 
   const baseInstructions = `
 Eres "Marta", asistente de urgencias de "Reparaciones Express 24h Costa del Sol". Hablas SIEMPRE en español neutro.
@@ -159,44 +168,45 @@ Si es horario diurno NO menciones precios nocturnos.
 
 Cierre obligatorio:
 "Perfecto. Voy a enviar el aviso al técnico de guardia por WhatsApp ahora mismo y te llamará para confirmar disponibilidad y tiempo estimado."
-Luego despedida:
-- si parte del día = mañana: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenos días, hasta luego."
-- si parte del día = tarde: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buenas tardes, hasta luego."
-- si parte del día = noche: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buena noche, hasta luego."
+Luego despedida según parte del día (mañana/tarde/noche).
+IMPORTANTE: NO leas el resumen interno al cliente.
+`;
 
-IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del parte para enviar por SMS. No lo leas al cliente.
-`.trim();
+  // Conexión a OpenAI Realtime
+  const openaiWs = new WebSocket(
+    `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(REALTIME_MODEL)}`,
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        "OpenAI-Beta": "realtime=v1"
+      }
+    }
+  );
 
   openaiWs.on("open", () => {
     console.log("✅ OpenAI realtime conectado", { model: REALTIME_MODEL });
 
-    openaiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          instructions:
-            baseInstructions +
-            `\nContexto horario: es_noche=${night}, parte_del_dia=${part}.`,
-          voice: REALTIME_VOICE,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          turn_detection: { type: "server_vad" },
-          modalities: ["audio", "text"],
-          temperature: 0.4
-        }
-      })
-    );
+    openaiWs.send(JSON.stringify({
+      type: "session.update",
+      session: {
+        instructions: baseInstructions + `\nContexto horario: es_noche=${night}, parte_del_dia=${part}.`,
+        voice: REALTIME_VOICE,
+        input_audio_format: "g711_ulaw",
+        output_audio_format: "g711_ulaw",
+        turn_detection: { type: "server_vad" },
+        modalities: ["audio", "text"],
+        temperature: 0.4
+      }
+    }));
 
     // Saludo inicial
-    openaiWs.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          modalities: ["audio", "text"],
-          instructions: "Empieza con el saludo exacto del guion y espera respuesta."
-        }
-      })
-    );
+    openaiWs.send(JSON.stringify({
+      type: "response.create",
+      response: {
+        modalities: ["audio", "text"],
+        instructions: `Empieza con el saludo exacto del guion y espera respuesta.`
+      }
+    }));
   });
 
   openaiWs.on("message", (raw) => {
@@ -204,40 +214,38 @@ IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del
     try {
       msg = JSON.parse(raw.toString());
     } catch {
-      return;
+      return; // evitamos que muera por un chunk raro
     }
 
     // Audio hacia Twilio
     if (msg.type === "response.audio.delta") {
-      if (!streamSid) return; // aún no tenemos streamSid (llega en start)
-      twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: msg.delta }
-        })
-      );
+      if (!streamSid) return;
+      twilioWs.send(JSON.stringify({
+        event: "media",
+        streamSid,
+        media: { payload: msg.delta }
+      }));
     }
 
-    // Transcript del cliente
+    // Transcripción del cliente
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = msg.transcript || "";
-      transcript += `\nCLIENTE: ${t}`;
+      if (t.trim()) transcript += `\nCLIENTE: ${t.trim()}`;
     }
   });
 
   openaiWs.on("close", (code, reason) => {
-    console.log("🟦 OpenAI realtime cerrado", { code, reason: reason?.toString?.() });
-    try {
-      twilioWs.close();
-    } catch {}
+    console.log("🔌 OpenAI realtime cerrado", { code, reason: String(reason || "") });
+    // Si OpenAI se cae, dejamos que Twilio cierre por su lado (evitamos loops raros)
+    try { twilioWs.close(); } catch {}
   });
 
   openaiWs.on("error", (e) => {
-    console.error("🟥 OpenAI WS error", e?.message || e);
+    console.error("❌ OpenAI WS error", e?.message || e);
+    try { twilioWs.close(); } catch {}
   });
 
-  // Twilio WS inbound
+  // Eventos de Twilio
   twilioWs.on("message", async (raw) => {
     let data;
     try {
@@ -255,12 +263,10 @@ IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del
 
     if (data.event === "media") {
       if (openaiWs.readyState === WebSocket.OPEN) {
-        openaiWs.send(
-          JSON.stringify({
-            type: "input_audio_buffer.append",
-            audio: data.media.payload
-          })
-        );
+        openaiWs.send(JSON.stringify({
+          type: "input_audio_buffer.append",
+          audio: data.media.payload
+        }));
       }
       return;
     }
@@ -268,7 +274,6 @@ IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del
     if (data.event === "stop") {
       console.log("🛑 Twilio stop", { callSid, streamSid });
 
-      // SMS al colgar (si falla OpenAI, mandamos algo mínimo)
       try {
         const extracted = await extractTicket(transcript, night);
         const smsText = formatSms(extracted, callSid);
@@ -276,55 +281,62 @@ IMPORTANTE: Al final de la llamada, genera un resumen interno con los campos del
         console.log("✅ SMS enviado");
       } catch (e) {
         console.error("❌ Error enviando SMS", e?.message || e);
-      } finally {
+        // manda SMS mínimo para saber que hubo llamada
         try {
-          openaiWs.close();
+          const smsText = formatSms({
+            ...newTicket(),
+            notas: transcript.trim() ? "Error extrayendo parte" : "Sin transcripción (posible fallo de audio)"
+          }, callSid);
+          await sendSms(process.env.ALERT_TO_NUMBER, smsText);
         } catch {}
+      } finally {
+        try { openaiWs.close(); } catch {}
+        try { twilioWs.close(); } catch {}
       }
     }
   });
 
   twilioWs.on("close", () => {
-    console.log("🟦 Twilio WS cerrado");
-    try {
-      openaiWs.close();
-    } catch {}
+    console.log("🔌 Twilio WS cerrado");
+    try { openaiWs.close(); } catch {}
   });
 
-  twilioWs.on("error", (e) => console.error("🟥 Twilio WS error", e?.message || e));
+  twilioWs.on("error", (e) => {
+    console.error("❌ Twilio WS error", e?.message || e);
+    try { openaiWs.close(); } catch {}
+  });
 });
 
+// Extraer parte con OpenAI (texto) para el SMS
 async function extractTicket(transcript, night) {
   const model = process.env.EXTRACT_MODEL || "gpt-4o-mini";
 
-  // Si no hay transcript, devolvemos vacío para no romper JSON.parse
-  if (!transcript || transcript.trim().length < 5) {
+  // Si no hay transcripción, devolvemos ticket vacío con nota
+  if (!transcript || !transcript.trim()) {
     return {
-      nombre: "",
-      telefono: "",
-      direccion: "",
-      zona: "",
-      servicio: "",
-      averia: "",
-      urgente: "",
+      ...newTicket(),
       aceptoNocturno: night ? "no" : "n-a",
-      notas: "Sin transcripción (posible fallo de audio)."
+      notas: "Sin transcripción (posible fallo de audio)"
     };
   }
 
   const prompt = `
-Extrae un PARTE de servicio desde esta conversación (en español). Devuelve SOLO JSON válido.
+Extrae un PARTE de servicio desde esta conversación (en español).
+Devuelve SOLO JSON válido, sin texto extra.
+
 Campos:
-nombre, telefono, direccion, zona, servicio (uno de: fontanería/electricidad/cerrajería/persianas/electrodomésticos/pintura/mantenimiento), averia, urgente (si/no), aceptoNocturno (si/no/n-a), notas.
+nombre, telefono, direccion, zona,
+servicio (uno de: fontanería/electricidad/cerrajería/persianas/electrodomésticos/pintura/mantenimiento),
+averia, urgente (si/no), aceptoNocturno (si/no/n-a), notas.
 
 Reglas:
-- Si night=${night} entonces aceptoNocturno debe ser si/no según si aceptó el recargo. Si no se menciona, pon "no".
+- Si night=${night} entonces aceptoNocturno debe ser si/no. Si no se menciona, pon "no".
 - Si night=${night} es false, pon aceptoNocturno "n-a".
 - Si no hay dato, deja string vacío.
 
 TRANSCRIPCIÓN:
 ${transcript}
-`.trim();
+`;
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -334,7 +346,9 @@ ${transcript}
     },
     body: JSON.stringify({
       model,
-      input: prompt
+      input: prompt,
+      // 🔒 ayuda a que salga JSON limpio
+      response_format: { type: "json_object" }
     })
   });
 
@@ -343,35 +357,23 @@ ${transcript}
     throw new Error(`OpenAI extract failed: ${resp.status} ${text}`);
   }
 
-  // Responses suele traer output_text, pero si cambia, al menos no rompemos:
-  let outText = "";
+  let json;
   try {
-    const json = JSON.parse(text);
-    outText = (json.output_text || "").trim();
+    json = JSON.parse(text);
   } catch {
-    // si viniese ya como texto, seguimos
-    outText = text.trim();
+    throw new Error("OpenAI extract: respuesta no JSON");
   }
 
-  if (!outText) throw new Error("OpenAI extract devolvió vacío (output_text vacío).");
+  const out = (json.output_text || "").trim();
+  if (!out) throw new Error("OpenAI extract: output_text vacío");
 
-  return safeJsonParse(outText);
+  try {
+    return JSON.parse(out);
+  } catch {
+    throw new Error(`OpenAI extract: output_text no parseable: ${out.slice(0, 200)}`);
+  }
 }
 
-function formatSms(t, callSid) {
-  return [
-    "🛠️ AVISO URGENCIA (MARTA)",
-    `Servicio: ${t.servicio || "-"}`,
-    `Nombre: ${t.nombre || "-"}`,
-    `Tel: ${t.telefono || "-"}`,
-    `Dirección: ${t.direccion || "-"}`,
-    `Zona: ${t.zona || "-"}`,
-    `Urgente: ${t.urgente || "-"}`,
-    `Acepto nocturno: ${t.aceptoNocturno || "-"}`,
-    `Avería: ${t.averia || "-"}`,
-    `Notas: ${t.notas || "-"}`,
-    callSid ? `CallSid: ${callSid}` : ""
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
+// Evita que Render muera por errores sueltos
+process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
+process.on("uncaughtException", (e) => console.error("uncaughtException", e));
