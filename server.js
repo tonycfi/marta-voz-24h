@@ -323,26 +323,20 @@ wss.on("connection", (twilioWs) => {
       return;
     }
     
-    console.log("📝 TRANSCRIPT CLIENTE:", t);
-    
     if (msg.type === "response.created") responseInFlight = true;
     if (msg.type === "response.done") responseInFlight = false;
 
     // Captura transcripción del cliente (si llega)
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = msg.transcript || "";
+      console.log("📝 TRANSCRIPT CLIENTE:", t);
       if (t) {
         transcript += `CLIENTE: ${t}\n`;
-      
-       // 🚀 Responder SOLO cuando ya hay texto del cliente
-       if (!responseInFlight) {
-         openaiWs.send(JSON.stringify({
-           type: "response.create",
-           response: { modalities: ["audio", "text"] }
-         }));
-       }
-     }
-   }
+      }
+    }
+    
+    if (msg.type === "response.output_text.delta") { ... }
+    if (msg.type === "response.output_text.done") { ... }
     
     if (msg.type === "response.output_text.delta") {
       const t = msg.delta || "";
@@ -428,10 +422,9 @@ wss.on("connection", (twilioWs) => {
       }
       return;
     }
-    
-    console.log("📦 TRANSCRIPT FINAL:\n", transcript);
 
     if (data.event === "stop") {
+      console.log("📦 TRANSCRIPT FINAL:\n", transcript);
       console.log("🛑 Twilio stop", { callSid, streamSid });
 
       // Si no hubo transcripción, mandamos fallback
