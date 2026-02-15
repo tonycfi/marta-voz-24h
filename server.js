@@ -66,11 +66,9 @@ app.get("/", (_, res) => res.send("Marta voz activa ✅"));
 // --- Twilio Voice webhook ---
 app.post("/voice", (req, res) => {
   const host = req.get("host");
-  const from = encodeURIComponent(req.body.From || "");
-  const callSid = encodeURIComponent(req.body.CallSid || "");
 
-  // NO ponemos track=... (te daba Invalid Track configuration)
-  const wsUrl = `wss://${host}/twilio-media?from=${from}&callSid=${callSid}`;
+  // No usamos track=... (te daba "Invalid Track configuration")
+  const wsUrl = `wss://${host}/twilio-media`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -97,12 +95,12 @@ wss.on("connection", (twilioWs) => {
   let callSid = "";
   let fromNumber = "";
 
-  let transcript = ""; // transcripción del cliente
+  let transcript = "";
   let greeted = false;
 
-  // CLAVE anti-ruido:
-  // No dejamos que OpenAI hable hasta que confirme "session.updated"
+  // READY si llega session.created/updated, o por fallback en 1s
   let sessionReady = false;
+  let openaiConnected = false;
 
   console.log("📞 Twilio WS conectado");
 
@@ -137,7 +135,7 @@ Datos a recoger (en este orden, 1 pregunta cada vez):
    fontanería, electricidad, cerrajería, persianas, termo/agua caliente,
    aire acondicionado, electrodomésticos, pintura, mantenimiento
 6) Descripción breve de la avería
-7) ¿Es urgente o hay riesgo? (agua/fuego/personas atrapadas) => urgente sí/no
+7) ¿Es urgente o hay riesgo? (agua/fuego/personas atrapadas) => urgente si/no
 
 Regla nocturna:
 Si es entre 22:00 y 08:00 (hora España), di literalmente:
@@ -153,13 +151,21 @@ Despedida según parte del día:
 - noche: "Gracias por confiar en Reparaciones Express 24h Costa del Sol. Que tengas buena noche, hasta luego."
 `;
 
+  function markReady(reason) {
+    if (sessionReady) return;
+    sessionReady = true;
+    console.log("✅ OpenAI session READY por:", reason);
+    startGreetingIfReady();
+  }
+
   function startGreetingIfReady() {
     if (greeted) return;
     if (!streamSid) return; // sin streamSid no mandamos audio a Twilio
     if (openaiWs.readyState !== WebSocket.OPEN) return;
-    if (!sessionReady) return; // 👈 CLAVE anti-ruido
+    if (!sessionReady) return;
 
     greeted = true;
+    console.log("🗣️ Enviando saludo de Marta...");
 
     openaiWs.send(
       JSON.stringify({
@@ -173,9 +179,10 @@ Despedida según parte del día:
   }
 
   openaiWs.on("open", () => {
+    openaiConnected = true;
     console.log("🟢 OpenAI realtime conectado", { model: realtimeModel });
 
-    // Forzamos formatos g711_ulaw
+    // Config de sesión
     openaiWs.send(
       JSON.stringify({
         type: "session.update",
@@ -191,6 +198,11 @@ Despedida según parte del día:
         }
       })
     );
+
+    // ✅ Fallback: si no llega session.created/updated, a los 1000ms lo damos por ready
+    setTimeout(() => {
+      if (!sessionReady && openaiConnected) markReady("fallback_1000ms");
+    }, 1000);
   });
 
   openaiWs.on("message", (raw) => {
@@ -201,17 +213,23 @@ Despedida según parte del día:
       return;
     }
 
-    // ✅ Confirmación de que la sesión ya aplica g711_ulaw (anti-ruido)
+    // 🔎 (Opcional) si quieres ver el tipo de eventos:
+    // console.log("OpenAI msg.type:", msg.type);
+
+    if (msg.type === "session.created") {
+      markReady("session.created");
+      return;
+    }
     if (msg.type === "session.updated") {
-      sessionReady = true;
-      // Si Twilio ya dio "start", ahora sí saludamos
-      startGreetingIfReady();
+      markReady("session.updated");
       return;
     }
 
     // Audio OpenAI -> Twilio
     if (msg.type === "response.audio.delta") {
       if (!streamSid) return;
+      // Log muy ligero (si quieres: comenta la línea)
+      // console.log("🔊 audio.delta -> Twilio");
       twilioWs.send(
         JSON.stringify({
           event: "media",
@@ -222,10 +240,16 @@ Despedida según parte del día:
       return;
     }
 
-    // Transcripción del cliente (para SMS)
+    // Transcripción del cliente
     if (msg.type === "conversation.item.input_audio_transcription.completed") {
       const t = (msg.transcript || "").trim();
       if (t) transcript += `CLIENTE: ${t}\n`;
+      return;
+    }
+
+    // Si OpenAI responde con error
+    if (msg.type === "error") {
+      console.error("❌ OpenAI error payload:", msg);
       return;
     }
   });
@@ -245,11 +269,11 @@ Despedida según parte del día:
     if (data.event === "start") {
       streamSid = data.start?.streamSid || "";
       callSid = data.start?.callSid || "";
-      fromNumber = data.start?.customParameters?.from || "";
+      fromNumber = data.start?.customParameters?.From || "";
 
       console.log("☎️ Twilio start", { callSid, streamSid, fromNumber });
 
-      // Si OpenAI ya confirmó session.updated, ya podemos saludar
+      // Si ya está ready, saluda ya
       startGreetingIfReady();
       return;
     }
@@ -281,9 +305,7 @@ Despedida según parte del día:
           );
         } catch {}
       } finally {
-        try {
-          openaiWs.close();
-        } catch {}
+        try { openaiWs.close(); } catch {}
       }
       return;
     }
