@@ -69,11 +69,19 @@ app.post("/voice", (req, res) => {
   const host = req.get("host");
   const wsUrl = `wss://${escapeXml(host)}/twilio-media`;
 
-  // IMPORTANTE: NO poner track aquí (te daba "Invalid Track configuration")
+  // Twilio manda From/To/CallSid en el webhook /voice
+  const from = escapeXml(req.body.From || "");
+  const to = escapeXml(req.body.To || "");
+  const callSid = escapeXml(req.body.CallSid || "");
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="${wsUrl}" />
+    <Stream url="${wsUrl}">
+      <Parameter name="From" value="${from}" />
+      <Parameter name="To" value="${to}" />
+      <Parameter name="CallSid" value="${callSid}" />
+    </Stream>
   </Connect>
 </Response>`;
 
@@ -445,12 +453,10 @@ wss.on("connection", (twilioWs) => {
           }
           const extracted = await extractTicket({ transcript, night, fromNumber });
 
-          // Fallback definitivo por si el extractor lo deja vacío
-          if (extracted) {
-            const tel = (extracted.telefono || "").trim();
-            if (!tel) extracted.telefono = fromNumber || "";
+          if (extracted && !String(extracted.telefono || "").trim()) {
+            extracted.telefono = fromNumber || "";
           }
-
+          
           if (!extracted) {
             smsBody = [
               "🛠️ AVISO URGENCIA (MARTA)",
