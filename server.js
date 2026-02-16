@@ -151,7 +151,7 @@ function safeJsonParse(text) {
   return null;
 }
 
-async function extractTicket({ transcript, night }) {
+async function extractTicket({ transcript, night, fromNumber }) {
   const model = process.env.EXTRACT_MODEL || "gpt-4o-mini";
 
   const system = `
@@ -166,10 +166,11 @@ Reglas:
 - Si night=${night} entonces aceptoNocturno: "si" o "no" (si no se menciona, "no")
 - Si night=${night} es false, aceptoNocturno: "n-a"
 - Si falta un dato: "" (string vacío)
+- Si existe CALLER_NUMBER y telefono está vacío, usa CALLER_NUMBER como telefono.
 - notas: cualquier detalle útil
 `.trim();
 
-  const user = `TRANSCRIPCIÓN:\n${transcript || ""}`;
+  const user = `CALLER_NUMBER: ${fromNumber || ""}\nTRANSCRIPCIÓN:\n${transcript || ""}`;
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -442,7 +443,13 @@ wss.on("connection", (twilioWs) => {
           if (!transcript.trim()) {
             transcript = "SIN TRANSCRIPCIÓN: no se recibió texto del cliente/IA.\n";
           }
-          const extracted = await extractTicket({ transcript, night });
+          const extracted = await extractTicket({ transcript, night, fromNumber });
+
+          // Fallback definitivo por si el extractor lo deja vacío
+          if (extracted) {
+            const tel = (extracted.telefono || "").trim();
+            if (!tel) extracted.telefono = fromNumber || "";
+          }
 
           if (!extracted) {
             smsBody = [
