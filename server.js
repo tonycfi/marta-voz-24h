@@ -241,6 +241,8 @@ wss.on("connection", (twilioWs) => {
   let twilioReady = false;
   let greeted = false;
   let responseInFlight = false;
+  let responseLock = false;
+  let callFinished = false;
 
   console.log("📞 Twilio WS conectado");
 
@@ -318,21 +320,25 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "input_audio_buffer.speech_stopped") {
       // Evita commit vacío / demasiado corto (<100ms aprox)
       if (!hasAudioSinceCommit) return;
-      if (framesSinceCommit < 5) return;
+      if (framesSinceCommit < 6) return;
 
       openaiWs.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
       hasAudioSinceCommit = false;
       framesSinceCommit = 0;
 
       // Si no hay respuesta en vuelo, pide a Marta que responda
-      if (!responseInFlight) {
-        openaiWs.send(
-          JSON.stringify({
-            type: "response.create",
-            response: { modalities: ["audio", "text"] }
-          })
-        );
-      }
+      if (!responseInFlight && !responseLock && !callFinished) {
+        responseLock = true;
+
+        openaiWs.send(JSON.stringify({
+          type: "response.create",
+          response: { modalities: ["audio", "text"] }
+        }));
+
+        setTimeout(() => {
+          responseLock = false;
+        }, 800);
+      } 
     }
 
     // Captura transcripción del cliente (si llega)
@@ -358,6 +364,9 @@ wss.on("connection", (twilioWs) => {
     if (msg.type === "response.output_text.done") {
       if (inAssistantText) transcript += "\n";
       inAssistantText = false;
+      if (transcript.includes("hasta luego")) {
+      callFinished = true;
+    }
     }
 
     // Audio OpenAI -> Twilio
